@@ -1,4 +1,4 @@
-use std::{collections::{BTreeMap, HashMap, VecDeque}, hash::Hash, vec}; //used to store the users array in memory
+use std::{collections::{BTreeMap, HashMap, VecDeque}, hash::Hash, ptr::null, vec}; //used to store the users array in memory
 use axum::{
     Json, 
     Router, 
@@ -225,8 +225,8 @@ pub struct CreateMarketOrderRequest{
 }
 
 pub struct CreateMarketOrderResponse{
-    message: String,
-    trades: Vec<Trade>,
+    pub message: String,
+    pub trades: Vec<Trade>,
     pub status: StatusCode
 }
 
@@ -304,16 +304,31 @@ async fn user_db_actor(mut rx: mpsc::Receiver<DbCommand>){
 }
 
 async fn orderbook_actor(mut rx: mpsc::Receiver<OrderbookCommand>){
-    let mut Orderbook: HashMap<String, MarketBook>= HashMap::new();
+    let mut order_book: HashMap<String, MarketBook>= HashMap::new();
 
     println!("MarketBookDbActor Started");
 
     while let Some(cmd) = rx.recv().await{
         match cmd {
-            
+            OrderbookCommand::NewLimitOrder { market_id, user_id, side, qty, price, resp } => {
+                if order_book.contains_key(&market_id){
+
+                } else {
+                    println!("Market with Market id = {}, does not exist", market_id);
+                    let response: = OrderbookResponse {
+                        status: "Market does not exist".to_string(),
+                        fills: vec![] ,
+                        remaining_qty: 0,
+                        bids: None,
+                        asks: None
+                    };
+                };
+                let _ = resp.send(response);
+            }
         }
     }
 }
+
 
 async fn signup_function(
     State(db_tx): State<DbSender>,
@@ -388,13 +403,20 @@ async fn onramp_function(
 }
 
 async fn create_limit_order_function(
-    State(db_tx): State<DbSender>,
+    State(db_tx): State<OrderbookCommand>,
     Json(payload): Json<CreateMarketOrderRequest>
 ) -> CreateMarketOrderResponse{
     let (oneshot_tx, oneshot_rx) = oneshot::channel();
     let order_created = 
 
 }
+
+#[derive(Clone)]
+struct AppState {
+    db_tx: mpsc::Sender<DbCommand>,
+    ob_tx: mpsc::Sender<OrderbookCommand>,
+}
+
 #[tokio::main]
 async fn main() {
 
@@ -402,15 +424,21 @@ async fn main() {
     tokio::spawn(user_db_actor(rx));
     let (tx2, rx2 ) = mpsc::channel::<OrderbookCommand>(32);
     tokio::spawn(orderbook_actor(rx2));
-    let ob_tx = tx2.clone();
-    let db_tx = tx.clone();
+    // let ob_tx = tx2.clone();
+    // let db_tx = tx.clone();
     // build our application with a single route
+
+    let state = AppState {
+        db_tx: tx.clone(),
+        ob_tx: tx2.clone(),
+    };
+
     let app = Router::new().route("/", post(|| async{"Hello World!"}))
     .route("/signup", post(signup_function))
     .route("/signin", post(signin_function))
     .route("/onramp", post(onramp_function)) //this route will return OnRampResponse type of its own which tells back the request handler the updated balance
     .route("/createLimitOrder", post(create_limit_order_function))
-    .with_state(db_tx);
+    .with_state(state);
 
     // .route("/create_limit_order", post(create_limit_order_function))
     // .route("/create_market_order", post(create_market_order_function))
