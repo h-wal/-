@@ -9,6 +9,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use axum::extract::State;
+use axum::http::Response as HttpResponse;
 
 type DbSender = mpsc::Sender<DbCommand>;
 
@@ -123,30 +124,34 @@ enum DbCommand {
     // UpdateBalance { email: String, amount: u32 },
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 enum Side {
     Bid,
     Ask,
 }
 
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 struct Trade {
     buyer: String,
     seller: String,
     qty: u64,
     price : u64
 }
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 struct OrderSummary {
     owner: String,
     qty: u64,
     price: u64,
     side: Side,      // Reuse Side::Bid / Side::Ask
 }
+
 struct OrderbookResponse {
     status: String,
     fills: Vec<Trade> , //change to trade later,
     remaining_qty: u64,
-    bids: Option<Vec<OrderSummary>>,
-    asks: Option<Vec<OrderSummary>>
+    bids: Option<BTreeMap<u64, VecDeque<Order>>>,
+    asks: Option<BTreeMap<u64, VecDeque<Order>>>
 }
 enum OrderbookCommand {
     NewLimitOrder{
@@ -169,8 +174,9 @@ enum OrderbookCommand {
         resp: oneshot::Sender<OrderbookResponse>
     }
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Order{
+    user_id: String,
     qty: u64,
     price: u64,
     side: Side
@@ -193,6 +199,33 @@ impl MarketBook {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
         }
+    }
+
+    fn insert_order(&mut self, order: Order){
+        let target_side = match order.side {
+            Side::Bid => &mut self.bids,
+            Side::Ask => &mut self.asks
+        };
+
+        let entry = target_side.entry(order.price).or_insert_with(VecDeque::new);
+
+        entry.push_back(order)
+
+    }
+
+    fn summarize_side(side: &BTreeMap<u64, VecDeque<Order>>, side_type: Side) -> Vec<OrderSummary> {
+        let mut summaries = Vec::new();
+        for (price, orders) in side.iter() {
+            for order in orders.iter() {
+                summaries.push(OrderSummary {
+                    owner: order.user_id.clone(),
+                    qty: order.qty,
+                    price: *price,
+                    side: side_type.clone(),
+                });
+            }
+        }
+        summaries
     }
 }
 
@@ -261,20 +294,20 @@ pub struct GetOrderBookRequest {
     market_id: u64
 }
 
+#[derive(serde::Serialize)]
 pub struct GetOrderBookResponse {
+    #[serde(skip_serializing)] 
     status: StatusCode,
     message: String,
     bids: Option<Vec<OrderSummary>>,
     asks: Option<Vec<OrderSummary>>
 }
 
-impl IntoResponse for GetOrderBookResponse {        //This is to implement IntoResponse functionality so that axum can use it in http body
+impl IntoResponse for GetOrderBookResponse {
     fn into_response(self) -> Response {
-        let body = Json(serde_json::json!({"Message": self.message}));
-        (self.status, body).into_response()
+        axum::response::IntoResponse::into_response(Json(self))
     }
 }
-
 
 async fn user_db_actor(mut rx: mpsc::Receiver<DbCommand>){
     let mut users: HashMap<String, User> = HashMap::new();
@@ -361,7 +394,7 @@ async fn orderbook_actor(mut rx: mpsc::Receiver<OrderbookCommand>, db_tx: DbSend
 
                     let (oneshot_tx, oneshot_rx) = oneshot::channel(); //create oneshot cannel to talk to DB
                     let _ = db_tx.send(DbCommand::CheckUser {
-                        user_email: user_id,
+                        user_email: user_id.clone(),
                         response_status: oneshot_tx 
                     })
                     .await;
@@ -372,6 +405,19 @@ async fn orderbook_actor(mut rx: mpsc::Receiver<OrderbookCommand>, db_tx: DbSend
                             if response.user_exists {
                                 println!("User exits");
                                 println!("Market {} exists, inserting order...", market_id);
+
+
+                                if let Some(book) = order_book.get_mut(&market_id){
+                                    let order = Order{
+                                        qty: qty,
+                                        user_id: user_id,
+                                        price: price,
+                                        side: side
+                                    };
+
+                                    book.insert_order(order);
+                                }
+
                                 OrderbookResponse{
                                     status: "Order added Successfull".to_string(),
                                     fills: vec![],
@@ -445,13 +491,24 @@ async fn orderbook_actor(mut rx: mpsc::Receiver<OrderbookCommand>, db_tx: DbSend
             OrderbookCommand::GetBook { market_id, resp } => {
                 let response = if order_book.contains_key(&market_id){
                     println!("Market Exists , id = {}", market_id);
-                    OrderbookResponse{
-                        status: "Successfull! This is the current status of the orderBook".to_string(),
-                        fills: vec![],
-                        remaining_qty: 0,
-                        bids: None,
-                        asks: None
-                        } 
+
+                    if let Some(book) = order_book.get_mut(&market_id){
+                        OrderbookResponse{
+                                status: "Successfull! This is the current status of the orderBook".to_string(),
+                                fills: vec![],
+                                remaining_qty: 0,
+                                bids: Some(book.bids.clone()),
+                                asks: Some(book.asks.clone())
+                            } 
+                    } else{
+                        OrderbookResponse{
+                            status: "Cannot find the orderBook".to_string(),
+                            fills: vec![],
+                            remaining_qty: 0,
+                            bids: None,
+                            asks: None
+                        }
+                    }
                 } else{
                     println!("Market does not exists, id = {}", market_id);
                     OrderbookResponse { 
@@ -612,11 +669,26 @@ async fn get_order_book_function(
                 match oneshot_rx.await{
                     Ok(response)=> {
                         if response.status.contains("Successfull") {
-                            GetOrderBookResponse{
+
+                            let (bids, asks) = match (response.bids, response.asks) {
+                                (Some(bids_map), Some(asks_map)) => {
+                                    let book = MarketBook {
+                                        bids: bids_map.clone(),
+                                        asks: asks_map.clone(),
+                                    };
+                                    (
+                                        Some(MarketBook::summarize_side(&book.bids, Side::Bid)),
+                                        Some(MarketBook::summarize_side(&book.asks, Side::Ask)),
+                                    )
+                                }
+                                _ => (Some(vec![]), Some(vec![]))
+                            };
+                            
+                            GetOrderBookResponse {
                                 status: StatusCode::OK,
                                 message: "Succesfully fetched the Order Book".to_string(),
-                                bids: response.bids,
-                                asks: response.asks
+                                bids,
+                                asks
                             }
                         } else {
                             GetOrderBookResponse { 
